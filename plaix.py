@@ -511,6 +511,32 @@ print(f"🔧 Initial device: {device}")
 model = load_yolo_model("yolov11x-rocketleague-best.pt", device)
 print("Model classes:", model.names)
 
+import websocket
+import json
+
+# Global variable for the socket
+ws_client = None
+
+def connect_to_overlay():
+    global ws_client
+    try:
+        ws_client = websocket.create_connection("ws://localhost:8001")
+        print("[WS] Connected to Electron Overlay")
+    except Exception as e:
+        print(f"[WS] Connection failed: {e}")
+
+# Call this once during your startup
+threading.Thread(target=connect_to_overlay, daemon=True).start()
+
+def send_to_overlay(data):
+    global ws_client
+    if ws_client:
+        try:
+            ws_client.send(json.dumps(data))
+        except:
+            ws_client = None # Reset if connection drops
+
+
 TEAM_ABBR_MAP = {
     "Toronto Maple Leafs": "TOR", "Montreal Canadiens": "MTL", "Boston Bruins": "BOS", "Edmonton Oilers": "EDM",
     "Vancouver Canucks": "VAN", "Calgary Flames": "CGY", "Ottawa Senators": "OTT", "Winnipeg Jets": "WPG",
@@ -1724,43 +1750,51 @@ def safe_yolo_infer(frame):
     global device, CUDA_DISABLED, model
 
     try:
-        torch.cuda.synchronize()
+        # 1. Run Inference
         with torch.no_grad():
             results = model.predict(
                 frame,
                 conf=0.25,
-                iou=0.5,
+                iou=0.45, # Slightly lower IOU is better for fast-moving cars
                 verbose=False,
-                imgsz=640,
+                imgsz=416, # Optimized speed: 416 is plenty for RL
                 device=device
             )[0]
 
-    except Exception as e:
-        print(f"\n[ERROR] YOLO GPU inference error: {e}")
-        print("➡ Switching to CPU permanently.")
-        disable_cuda_permanently()
+        # 2. Prepare Data for the Electron Overlay
+        overlay_payload = []
+        
+        if hasattr(results, "boxes") and results.boxes is not None:
+            for box in results.boxes:
+                # Get coordinates [x1, y1, x2, y2]
+                b = box.xyxy[0].cpu().numpy()
+                cls_id = int(box.cls[0])
+                label = model.names[cls_id]
+                conf = float(box.conf[0])
 
-        try:
-            model.to("cpu")
-        except:
-            pass
+                overlay_payload.append({
+                    "label": label,
+                    "conf": conf,
+                    "x": float(b[0]),
+                    "y": float(b[1]),
+                    "w": float(b[2] - b[0]),
+                    "h": float(b[3] - b[1])
+                })
 
-        device = "cpu"
-        return []
+        # 3. Send to Electron (Port 8001)
+        # Assuming you added the 'send_to_overlay' helper we discussed
+        if overlay_payload:
+            send_to_overlay(overlay_payload)
 
-    try:
-        if not hasattr(results, "boxes"):
-            return []
-
-        if results.boxes is None or len(results.boxes) == 0:
-            return []
-
+        # 4. Return the original boxes for your Python bot logic
         return results.boxes.cpu().numpy()
 
     except Exception as e:
-        print(f"[ERROR] YOLO box extraction failure: {e}")
+        print(f"\n[ERROR] YOLO inference/overlay error: {e}")
+        # Only switch to CPU if it's a critical CUDA memory error
+        if "CUDA" in str(e) and not CUDA_DISABLED:
+            disable_cuda_permanently()
         return []
-
 # ============================================================
 #                    BROADCAST WORKER
 # ============================================================
@@ -4994,4 +5028,3 @@ Image prompt:"""
         print("\n[SHUTDOWN] Shutting down PLAIX...")
     except KeyboardInterrupt:
         print("\n[SHUTDOWN] Shutting down PLAIX...")
-
